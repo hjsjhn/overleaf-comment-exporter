@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Overleaf Comment Exporter",
+  "version": "1.0.0",
+  "description": "Load and export comments from Overleaf projects",
+  "permissions": ["activeTab", "scripting"],
+  "host_permissions": ["https://www.overleaf.com/*"],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "48": "icons/icon48.png"
+    }
+  },
+  "icons": {
+    "48": "icons/icon48.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.overleaf.com/project/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["injected.js"],
+      "matches": ["https://www.overleaf.com/*"]
+    }
+  ]
+}
