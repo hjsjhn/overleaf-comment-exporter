@@ -211,6 +211,10 @@
           comment.content = "";
           comment.replies = [];
         }
+        // Use API resolved status as the authoritative source
+        if (thread && thread.resolved !== undefined) {
+          comment.resolved = !!thread.resolved;
+        }
       }
     }
 

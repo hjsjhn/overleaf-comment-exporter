@@ -1,6 +1,14 @@
 // Injected into the page's MAIN world to access React fiber tree
+// Uses a global namespace to avoid duplicate listeners on re-injection
 (function () {
-  window.addEventListener("message", (event) => {
+  const NS = "__ol_comment_exporter__";
+
+  // Remove any existing listener from a previous injection
+  if (window[NS]) {
+    window.removeEventListener("message", window[NS].handler);
+  }
+
+  function handler(event) {
     if (event.source !== window || event.data?.type !== "OL_COMMENT_EXPORT_REQUEST") return;
 
     const result = extractCommentsFromReact();
@@ -9,7 +17,11 @@
       { type: "OL_COMMENT_EXPORT_RESPONSE", data: result, requestId: event.data.requestId },
       "*"
     );
-  });
+  }
+
+  // Store reference so next injection can clean up
+  window[NS] = { handler };
+  window.addEventListener("message", handler);
 
   function extractCommentsFromReact() {
     const reviewPanel = document.querySelector(".review-panel-container");
@@ -23,6 +35,22 @@
     const rootFiber = reviewPanel[containerKey];
     const filesWithComments = [];
 
+    // First pass: collect resolved state by comment ID
+    const resolvedMap = new Map();
+
+    function collectResolved(fiber, depth) {
+      if (!fiber || depth > 500) return;
+      const props = fiber.memoizedProps;
+      if (props && props.comment !== undefined && props.isResolved !== undefined) {
+        resolvedMap.set(props.comment.id, props.isResolved);
+      }
+      collectResolved(fiber.child, depth + 1);
+      collectResolved(fiber.sibling, depth + 1);
+    }
+
+    collectResolved(rootFiber, 0);
+
+    // Second pass: collect file groups with comment data
     function walk(fiber, depth) {
       if (!fiber || depth > 300) return;
       const props = fiber.memoizedProps;
@@ -39,6 +67,7 @@
           threadId: c.op?.t,
           userId: c.metadata?.user_id,
           timestamp: c.metadata?.ts,
+          resolved: !!resolvedMap.get(c.id),
         }));
 
         filesWithComments.push({ file, path, comments });

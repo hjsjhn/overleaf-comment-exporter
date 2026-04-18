@@ -6,6 +6,7 @@ const $$ = (sel) => document.querySelectorAll(sel);
 const app = {
   data: null,
   selectedComments: new Set(), // "fileIdx:commentIdx"
+  showResolved: false,
 };
 
 // --- Tab communication ---
@@ -21,16 +22,54 @@ async function sendMessage(action) {
     showError("Please open an Overleaf project page first.");
     return null;
   }
-  return chrome.tabs.sendMessage(tab.id, { action });
+  try {
+    return await chrome.tabs.sendMessage(tab.id, { action });
+  } catch (e) {
+    // Content script not loaded yet — inject it and retry
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ["content.js"],
+      });
+      await new Promise((r) => setTimeout(r, 200));
+      return await chrome.tabs.sendMessage(tab.id, { action });
+    } catch (e2) {
+      showError("Failed to connect. Please reload the Overleaf page and try again.");
+      return null;
+    }
+  }
 }
 
 // --- Data loading ---
 
 async function loadComments() {
   showLoading();
-  const resp = await sendMessage("getComments");
-  if (!resp) return;
 
+  const tab = await getActiveTab();
+  if (!tab || !tab.url?.includes("overleaf.com/project")) {
+    showError("Please open an Overleaf project page first.");
+    return;
+  }
+
+  let resp = null;
+  try {
+    resp = await chrome.tabs.sendMessage(tab.id, { action: "getComments" });
+  } catch (e) {
+    // Content script not loaded — inject and retry
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ["content.js"],
+      });
+      await new Promise((r) => setTimeout(r, 300));
+      resp = await chrome.tabs.sendMessage(tab.id, { action: "getComments" });
+    } catch (e2) {
+      showError("Could not connect. Please reload the Overleaf page (Ctrl+Shift+R) and try again.");
+      return;
+    }
+  }
+
+  if (!resp) return;
   if (!resp.success) {
     showError(resp.error);
     return;
@@ -43,40 +82,63 @@ async function loadComments() {
 // --- Rendering ---
 
 function render() {
-  const { fileGroups, projectName, totalComments } = app.data;
+  const { fileGroups, projectName } = app.data;
+
+  // Count visible comments (always use original indices for selection keys)
+  let totalVisible = 0;
+  fileGroups.forEach((g) => {
+    g.comments.forEach((c) => {
+      if (app.showResolved || !c.resolved) totalVisible++;
+    });
+  });
 
   $("#project-name").textContent = projectName || "";
   $("#toolbar").classList.remove("hidden");
   $("#actions").classList.remove("hidden");
 
-  if (totalComments === 0) {
+  if (app.data.totalComments === 0) {
     $("#content").innerHTML = '<div class="message">No comments found in this project.</div>';
     updateCount();
     return;
   }
 
+  if (totalVisible === 0) {
+    $("#content").innerHTML = '<div class="message">All comments are resolved. Toggle "Show resolved" to see them.</div>';
+    updateCount();
+    updateButtons();
+    return;
+  }
+
   let html = "";
   fileGroups.forEach((group, fi) => {
-    if (group.comments.length === 0) return;
+    const visibleComments = group.comments.filter((c) => app.showResolved || !c.resolved);
+    if (visibleComments.length === 0) return;
+
+    const allVisibleSelected = visibleComments.every((c) => {
+      const ci = group.comments.indexOf(c);
+      return app.selectedComments.has(`${fi}:${ci}`);
+    });
 
     html += `<div class="file-group">
       <div class="file-header">
-        <input type="checkbox" data-file="${fi}" ${group.comments.every((_, ci) => app.selectedComments.has(`${fi}:${ci}`)) ? "checked" : ""}>
+        <input type="checkbox" data-file="${fi}" ${allVisibleSelected ? "checked" : ""}>
         <span class="file-name">${esc(group.file)}</span>
-        <span class="file-count">${group.comments.length} comment${group.comments.length > 1 ? "s" : ""}</span>
+        <span class="file-count">${visibleComments.length} comment${visibleComments.length > 1 ? "s" : ""}</span>
       </div>`;
 
-    group.comments.forEach((c, ci) => {
+    visibleComments.forEach((c) => {
+      const ci = group.comments.indexOf(c);
       const key = `${fi}:${ci}`;
       const selected = app.selectedComments.has(key);
       const highlighted = c.highlightedText
         ? `<div class="comment-highlight">&gt; ${esc(c.highlightedText)}</div>`
         : "";
-      html += `<div class="comment ${selected ? "selected" : ""}" data-key="${key}">
+      const resolvedCls = c.resolved ? " resolved" : "";
+      html += `<div class="comment${selected ? " selected" : ""}${resolvedCls}" data-key="${key}">
         <input type="checkbox" data-file="${fi}" data-comment="${ci}" ${selected ? "checked" : ""}>
         <div class="comment-body">
           <div class="comment-meta">
-            <span class="comment-author">${esc(c.author)}</span>
+            <span class="comment-author">${esc(c.author)}${c.resolved ? " (resolved)" : ""}</span>
             <span class="comment-time">${esc(c.timestamp ? new Date(c.timestamp).toLocaleString() : "")}</span>
           </div>
           ${highlighted}
@@ -105,17 +167,20 @@ function bindStaticEvents() {
   if (staticListenersBound) return;
   staticListenersBound = true;
 
+  // Show resolved toggle
+  $("#show-resolved").addEventListener("change", (e) => {
+    app.showResolved = e.target.checked;
+    render();
+  });
+
   // Select all
   $("#select-all").addEventListener("change", () => {
-    const allSelected = app.data.fileGroups.every((g, fi) =>
-      g.comments.every((_, ci) => app.selectedComments.has(`${fi}:${ci}`))
-    );
+    const visible = getVisibleKeys();
+    const allSelected = visible.every((k) => app.selectedComments.has(k));
     if (allSelected) {
-      app.selectedComments.clear();
+      visible.forEach((k) => app.selectedComments.delete(k));
     } else {
-      app.data.fileGroups.forEach((g, fi) => {
-        g.comments.forEach((_, ci) => app.selectedComments.add(`${fi}:${ci}`));
-      });
+      visible.forEach((k) => app.selectedComments.add(k));
     }
     render();
   });
@@ -133,13 +198,14 @@ function bindStaticEvents() {
 
   // Invert selection
   $("#invert-btn").addEventListener("click", () => {
-    const allKeys = new Set();
-    app.data.fileGroups.forEach((g, fi) => {
-      g.comments.forEach((_, ci) => allKeys.add(`${fi}:${ci}`));
-    });
-    const newSelected = new Set();
-    allKeys.forEach((key) => {
-      if (!app.selectedComments.has(key)) newSelected.add(key);
+    const visible = getVisibleKeys();
+    const newSelected = new Set(app.selectedComments);
+    visible.forEach((key) => {
+      if (app.selectedComments.has(key)) {
+        newSelected.delete(key);
+      } else {
+        newSelected.add(key);
+      }
     });
     app.selectedComments = newSelected;
     render();
@@ -175,8 +241,12 @@ function bindDynamicEvents() {
     cb.addEventListener("change", (e) => {
       const fi = e.target.dataset.file;
       const group = app.data.fileGroups[fi];
-      const allSelected = group.comments.every((_, ci) => app.selectedComments.has(`${fi}:${ci}`));
-      group.comments.forEach((_, ci) => {
+      const visible = [];
+      group.comments.forEach((c, ci) => {
+        if (app.showResolved || !c.resolved) visible.push(ci);
+      });
+      const allSelected = visible.every((ci) => app.selectedComments.has(`${fi}:${ci}`));
+      visible.forEach((ci) => {
         const key = `${fi}:${ci}`;
         if (allSelected) {
           app.selectedComments.delete(key);
@@ -207,17 +277,26 @@ function updateFileCheckbox(fi) {
   if (cb) cb.checked = allSelected;
 }
 
+function getVisibleKeys() {
+  const keys = [];
+  app.data.fileGroups.forEach((g, fi) => {
+    g.comments.forEach((c, ci) => {
+      if (app.showResolved || !c.resolved) keys.push(`${fi}:${ci}`);
+    });
+  });
+  return keys;
+}
+
 function updateSelectAll() {
-  const allSelected = app.data.fileGroups.every((g, fi) =>
-    g.comments.every((_, ci) => app.selectedComments.has(`${fi}:${ci}`))
-  );
+  const visible = getVisibleKeys();
+  const allSelected = visible.length > 0 && visible.every((k) => app.selectedComments.has(k));
   $("#select-all").checked = allSelected;
 }
 
 function updateCount() {
-  const total = app.data?.totalComments || 0;
-  const selected = app.selectedComments.size;
-  $("#count").textContent = `${selected}/${total} selected`;
+  const visible = getVisibleKeys();
+  const selected = visible.filter((k) => app.selectedComments.has(k)).length;
+  $("#count").textContent = `${selected}/${visible.length} selected`;
 }
 
 function updateButtons() {

@@ -219,8 +219,11 @@ header h1 {
 }
 
 .comment.resolved .comment-content {
-  text-decoration: line-through;
-  opacity: 0.6;
+  opacity: 0.55;
+}
+
+.comment.resolved .comment-highlight {
+  opacity: 0.55;
 }
 
 /* Actions bar */
